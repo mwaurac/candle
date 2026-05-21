@@ -89,11 +89,11 @@ impl RotaryEmbedding {
         seqlen_offset: usize,
     ) -> Result<(Tensor, Tensor)> {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
-        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
-        Ok((q_embed, k_embed))
+            let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
+            let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+            let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+            let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+            Ok((q_embed, k_embed))
     }
 }
 
@@ -142,11 +142,15 @@ impl ProportionalRotaryEmbedding {
         seqlen_offset: usize,
     ) -> Result<(Tensor, Tensor)> {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
-        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
-        Ok((q_embed, k_embed))
+
+        use candle_nn::rotary_emb::rope;
+
+            let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
+            let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+            let q_embed = rope(&q.contiguous()?, &cos, &sin)?;
+            let k_embed = rope(&k.contiguous()?, &cos, &sin)?;
+            Ok((q_embed, k_embed))
+       
     }
 }
 
@@ -383,6 +387,24 @@ impl Attention {
     }
 }
 
+// ── KV shared layer helpers ──────────────────────────────────────────────────
+
+fn first_kv_shared_layer_idx(cfg: &Gemma4TextConfig) -> usize {
+    cfg.num_hidden_layers
+        .saturating_sub(cfg.num_kv_shared_layers)
+}
+
+fn kv_shared_layer_index(cfg: &Gemma4TextConfig, layer_idx: usize) -> Option<usize> {
+    let first_shared = first_kv_shared_layer_idx(cfg);
+    if first_shared == 0 || layer_idx < first_shared {
+        return None;
+    }
+    let attention_type = &cfg.layer_types[layer_idx];
+    cfg.layer_types[..first_shared]
+        .iter()
+        .rposition(|ty| ty == attention_type)
+}
+
 // ── DecoderLayer ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -395,6 +417,7 @@ struct DecoderLayer {
     post_feedforward_layernorm: RmsNorm,
     #[allow(dead_code)]
     is_sliding: bool,
+    layer_scalar: Option<Tensor>,
 }
 
 impl DecoderLayer {
@@ -413,9 +436,21 @@ impl DecoderLayer {
             layer_idx,
             vb.pp("self_attn"),
         )?;
+
+        let kv_shared = kv_shared_layer_index(cfg, layer_idx);
+        let mlp_intermediate = if cfg.use_double_wide_mlp && kv_shared.is_some() {
+            cfg.intermediate_size * 2
+        } else {
+            cfg.intermediate_size
+        };
+        let mlp_intermediate = cfg
+            .intermediate_sizes
+            .as_ref()
+            .map(|sizes| sizes[layer_idx])
+            .unwrap_or(mlp_intermediate);
         let mlp = MLP::new(
             cfg.hidden_size,
-            cfg.intermediate_size,
+            mlp_intermediate,
             cfg.hidden_activation,
             false,
             vb.pp("mlp"),
@@ -437,6 +472,7 @@ impl DecoderLayer {
             cfg.rms_norm_eps,
             vb.pp("post_feedforward_layernorm"),
         )?;
+        let layer_scalar = vb.get((1,), "layer_scalar").ok();
         Ok(Self {
             self_attn,
             mlp,
@@ -445,6 +481,7 @@ impl DecoderLayer {
             pre_feedforward_layernorm,
             post_feedforward_layernorm,
             is_sliding,
+            layer_scalar,
         })
     }
 
@@ -453,20 +490,27 @@ impl DecoderLayer {
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         sliding_attention_mask: Option<&Tensor>,
-        seqlen_offset: usize,
+        seqlen_offsets: usize,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs =
-            self.self_attn
-                .forward(&xs, attention_mask, sliding_attention_mask, seqlen_offset)?;
+        let xs = self.self_attn.forward(
+            &xs,
+            attention_mask,
+            sliding_attention_mask,
+            seqlen_offsets,
+        )?;
         let xs = xs.apply(&self.post_attention_layernorm)?;
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = xs.apply(&self.pre_feedforward_layernorm)?;
         let xs = xs.apply(&self.mlp)?;
         let xs = xs.apply(&self.post_feedforward_layernorm)?;
-        residual + xs
+        let xs = (residual + xs)?;
+        match &self.layer_scalar {
+            Some(scalar) => xs.broadcast_mul(scalar),
+            None => Ok(xs),
+        }
     }
 
     fn clear_kv_cache(&mut self) {
@@ -528,13 +572,12 @@ pub struct TextModel {
 }
 
 impl TextModel {
-    pub fn new(cfg: &Gemma4TextConfig, vb: VarBuilder) -> Result<Self> {
-        let vb_m = vb.pp("model");
+    pub fn new(cfg: &Gemma4TextConfig, vb_m: VarBuilder) -> Result<Self> {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
 
         let rotary_emb_global = Arc::new(ProportionalRotaryEmbedding::new(
-            vb.dtype(),
+            vb_m.dtype(),
             cfg.global_head_dim,
             cfg.rope_theta,
             cfg.partial_rotary_factor(),
@@ -542,7 +585,7 @@ impl TextModel {
             vb_m.device(),
         )?);
         let rotary_emb_local = Arc::new(RotaryEmbedding::new(
-            vb.dtype(),
+            vb_m.dtype(),
             cfg.head_dim,
             cfg.rope_local_base_freq(),
             cfg.max_position_embeddings,
@@ -565,7 +608,7 @@ impl TextModel {
         let lm_head = if cfg.tie_word_embeddings {
             Linear::new(embed_tokens.embeddings().clone(), None)
         } else {
-            candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+            candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb_m.pp("lm_head"))?
         };
         Ok(Self {
             embed_tokens,
@@ -573,8 +616,8 @@ impl TextModel {
             norm,
             lm_head,
             final_logit_softcapping: cfg.final_logit_softcapping,
-            device: vb.device().clone(),
-            dtype: vb.dtype(),
+            device: vb_m.device().clone(),
+            dtype: vb_m.dtype(),
             hidden_size: cfg.hidden_size,
             sliding_window: cfg.sliding_window,
         })

@@ -43,6 +43,10 @@ fn default_sliding_window_pattern() -> usize {
 fn default_global_head_dim() -> usize {
     512
 }
+fn default_attn_k_eq_v() -> bool { false }
+fn default_enable_moe_block() -> bool { false }
+fn default_num_kv_shared_layers() -> usize { 0 }
+fn default_use_double_wide_mlp() -> bool { false }
 fn default_use_flash_attn() -> bool {
     false
 }
@@ -77,6 +81,10 @@ pub struct Gemma4TextConfig {
     pub hidden_activation: Activation,
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    #[serde(default)]
+    pub intermediate_sizes: Option<Vec<usize>>,
+    #[serde(default = "default_use_double_wide_mlp")]
+    pub use_double_wide_mlp: bool,
     #[serde(default = "default_num_attention_heads")]
     pub num_attention_heads: usize,
     pub num_hidden_layers: usize,
@@ -104,9 +112,21 @@ pub struct Gemma4TextConfig {
     pub layer_types: Vec<String>,
     #[serde(default = "default_global_head_dim")]
     pub global_head_dim: usize,
+    #[serde(default = "default_attn_k_eq_v")]
+    pub attention_k_eq_v: bool,
     pub num_global_key_value_heads: Option<usize>,
+    #[serde(default = "default_enable_moe_block")]
+    pub enable_moe_block: bool,
+    #[serde(default = "default_num_kv_shared_layers")]
+    pub num_kv_shared_layers: usize,
+    pub num_experts: Option<usize>,
+    pub top_k_experts: Option<usize>,
     pub rope_parameters: Option<Gemma4RopeParameters>,
     pub use_bidirectional_attention: Option<String>,
+    #[serde(default)]
+    pub hidden_size_per_layer_input: Option<usize>,
+    #[serde(default)]
+    pub vocab_size_per_layer_input: Option<usize>,
     #[serde(default = "default_use_flash_attn")]
     pub use_flash_attn: bool,
 }

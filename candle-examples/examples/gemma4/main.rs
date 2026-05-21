@@ -286,7 +286,7 @@ fn main() -> Result<()> {
                 serde_json::from_slice(&std::fs::read(config_file)?)?
             }
         };
-        let model = Model::new(&config, vb)?;
+        let model = Model::new(&config, vb.pp("model"))?;
         ModelKind::Multimodal(model)
     } else {
         let mut config: Gemma4TextConfig = match args.config_file {
@@ -303,7 +303,7 @@ fn main() -> Result<()> {
             }
         };
         config.use_flash_attn = args.use_flash_attn;
-        let model = TextModel::new(&config, vb)?;
+        let model = TextModel::new(&config, vb.pp("model").pp("language_model"))?;
         ModelKind::TextOnly(model)
     };
 

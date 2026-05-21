@@ -31,8 +31,6 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Gemma4Config, vb: candle_nn::VarBuilder) -> Result<Self> {
-        let vb = vb.pp("model");
-
         let vision_tower = VisionTower::new(&cfg.vision_config, vb.pp("vision_tower"))?;
 
         let vis_hidden = cfg.vision_config.hidden_size;
